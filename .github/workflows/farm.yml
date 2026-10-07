@@ -86,6 +86,7 @@ jobs:
         run: |
           git config user.name farm-bot
           git config user.email farm-bot@users.noreply.github.com
+          test -f "results/$JOB.$SHARD.tar.gz.age" || { echo "nothing to commit"; exit 0; }
           git add "results/$JOB.$SHARD.tar.gz.age"
           git commit -q -m "results: $JOB shard $SHARD" || exit 0
           for i in 1 2 3 4 5 6; do
