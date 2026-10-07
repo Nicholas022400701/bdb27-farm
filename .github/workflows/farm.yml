@@ -1,0 +1,98 @@
+name: farm
+on:
+  workflow_dispatch:
+    inputs:
+      job:
+        description: job name (jobs/<job>.tar.age)
+        required: true
+        type: string
+      shards:
+        description: JSON list of shard ids, e.g. [0,1,2,3]
+        required: false
+        default: "[0]"
+        type: string
+permissions:
+  contents: write
+jobs:
+  run:
+    if: github.actor == github.repository_owner
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(inputs.shards) }}
+    env:
+      JOB: ${{ inputs.job }}
+      SHARD: ${{ matrix.shard }}
+      N_SHARDS: ${{ strategy.job-total }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: farm/requirements.txt
+      - name: tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq age > /dev/null
+          pip install -q -r farm/requirements.txt
+      - name: restore data cache
+        uses: actions/cache@v4
+        with:
+          path: data
+          key: bdb27-data-v1
+      - name: decrypt job bundle
+        env:
+          AGE_IN_IDENTITY: ${{ secrets.AGE_IN_IDENTITY }}
+        run: |
+          set +x
+          test -n "$AGE_IN_IDENTITY" || { echo "missing secret AGE_IN_IDENTITY"; exit 1; }
+          test -f "jobs/$JOB.tar.age" || { echo "no bundle jobs/$JOB.tar.age"; exit 1; }
+          mkdir -p work out data
+          umask 077; printf '%s\n' "$AGE_IN_IDENTITY" > "$RUNNER_TEMP/in.key"
+          age -d -i "$RUNNER_TEMP/in.key" "jobs/$JOB.tar.age" | tar -x -C work
+          rm -f "$RUNNER_TEMP/in.key"
+          test -f work/job.py || { echo "bundle has no job.py"; exit 1; }
+      - name: fetch data if not cached
+        run: bash farm/fetch_data.sh
+      - name: run job
+        run: |
+          set +x
+          cd work
+          DATA_DIR="$GITHUB_WORKSPACE/data" OUT_DIR="$GITHUB_WORKSPACE/out" \
+            python job.py > "$GITHUB_WORKSPACE/out/log.txt" 2>&1 && rc=0 || rc=$?
+          echo "$rc" > "$GITHUB_WORKSPACE/out/exit_code.txt"
+          echo "job exit code $rc"
+      - name: encrypt results
+        if: always()
+        env:
+          AGE_OUT_RECIPIENT: ${{ secrets.AGE_OUT_RECIPIENT }}
+        run: |
+          set +x
+          test -n "$AGE_OUT_RECIPIENT" || { echo "missing secret AGE_OUT_RECIPIENT"; exit 1; }
+          mkdir -p results out
+          tar -C out -czf - . | age -r "$AGE_OUT_RECIPIENT" -o "results/$JOB.$SHARD.tar.gz.age"
+          ls -la "results/$JOB.$SHARD.tar.gz.age"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ${{ inputs.job }}-${{ matrix.shard }}
+          path: results/*.age
+          retention-days: 14
+      - name: commit results
+        if: always()
+        run: |
+          git config user.name farm-bot
+          git config user.email farm-bot@users.noreply.github.com
+          git add "results/$JOB.$SHARD.tar.gz.age"
+          git commit -q -m "results: $JOB shard $SHARD" || exit 0
+          for i in 1 2 3 4 5 6; do
+            git pull -q --rebase && git push -q && exit 0
+            sleep $((RANDOM % 10 + 3))
+          done
+          exit 1
+      - name: status
+        if: always()
+        run: test "$(cat out/exit_code.txt 2>/dev/null)" = "0"

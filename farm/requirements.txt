@@ -1,0 +1,10 @@
+duckdb
+polars
+pyarrow
+pandas
+numpy
+scipy
+statsmodels
+scikit-learn
+lightgbm
+matplotlib
